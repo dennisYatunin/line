@@ -1,7 +1,69 @@
 #include "png.h"
-#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
 
-const unsigned int crc32_lookup_table[] = {
+void error(const char *msg) {
+	fprintf(stderr, "%s\n", msg);
+	exit(EXIT_FAILURE);
+}
+
+/* ========================================================================== */
+
+uint8_t *write_be_be(uint32_t value, uint8_t *buf) {
+	*buf++ = (value >> 0)  & 0xFF;
+	*buf++ = (value >> 8)  & 0xFF;
+	*buf++ = (value >> 16) & 0xFF;
+	*buf++ = (value >> 24) & 0xFF;
+	return buf;
+}
+
+uint8_t *write_be_le(uint32_t value, uint8_t *buf) {
+	*buf++ = (value >> 24) & 0xFF;
+	*buf++ = (value >> 16) & 0xFF;
+	*buf++ = (value >> 8)  & 0xFF;
+	*buf++ = (value >> 0)  & 0xFF;
+	return buf;
+}
+
+uint8_t *write_be_me1(uint32_t value, uint8_t *buf) {
+	*buf++ = (value >> 8)  & 0xFF;
+	*buf++ = (value >> 0)  & 0xFF;
+	*buf++ = (value >> 16) & 0xFF;
+	*buf++ = (value >> 24) & 0xFF;
+	return buf;
+}
+
+uint8_t *write_be_me2(uint32_t value, uint8_t *buf) {
+	*buf++ = (value >> 16) & 0xFF;
+	*buf++ = (value >> 24) & 0xFF;
+	*buf++ = (value >> 0)  & 0xFF;
+	*buf++ = (value >> 8)  & 0xFF;
+	return buf;
+}
+
+write_be_function get_write_be_function() {
+	uint8_t buf[] = {0x00, 0x01, 0x02, 0x03};
+
+	switch (*((uint32_t *)buf)) {
+		case 0x00010203: // big-endian
+			return write_be_be;
+		case 0x03020100: // little-endian
+			return write_be_le;
+		case 0x01000302: // middle-endian, PDP-11 style
+			return write_be_me1;
+		case 0x02030001: // middle-endian, Honeywell 316 style
+			return write_be_me2;
+		default:         // unknown endianness
+			error("error: endianness of processor could not be determined");
+	}
+}
+
+write_be_function write_be = NULL;
+
+/* ========================================================================== */
+
+const uint32_t crc32_lookup_table[] = {
 	0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA, 0x076DC419, 0x706AF48F,
 	0xE963A535, 0x9E6495A3, 0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
 	0x09B64C2B, 0x7EB17CBD, 0xE7B82D07, 0x90BF1D91, 0x1DB71064, 0x6AB020F2,
@@ -47,42 +109,12 @@ const unsigned int crc32_lookup_table[] = {
 	0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
 };
 
-unsigned int png_crc(const char *type, const unsigned char *data, int data_len) {
-	unsigned int crc = 0xFFFFFFFF;
+uint32_t crc32(const uint8_t *buf, size_t buf_len) {
+	uint32_t crc = 0xFFFFFFFF;
 
-	crc = crc32_lookup_table[(crc ^ *type++) & 0xFF] ^ (crc >> 8);
-	crc = crc32_lookup_table[(crc ^ *type++) & 0xFF] ^ (crc >> 8);
-	crc = crc32_lookup_table[(crc ^ *type++) & 0xFF] ^ (crc >> 8);
-	crc = crc32_lookup_table[(crc ^ *type) & 0xFF] ^ (crc >> 8);
-
-	while (data_len--) {
-		crc = crc32_lookup_table[(crc ^ *data++) & 0xFF] ^ (crc >> 8);
+	while (buf_len--) {
+		crc = crc32_lookup_table[(crc ^ *buf++) & 0xFF] ^ (crc >> 8);
 	}
 
 	return crc ^ 0xFFFFFFFF;
-}
-
-void png_chunk(const char *type, const unsigned char *data, int data_len, unsigned char *buf) {
-	unsigned int temp = htonl(data_len);
-	*buf++ = temp & 0xFF;
-	*buf++ = (temp >> 8) & 0xFF;
-	*buf++ = (temp >> 16) & 0xFF;
-	*buf++ = (temp >> 24) & 0xFF;
-
-	temp = htonl(png_crc(type, data, data_len));
-
-	*buf++ = *type++;
-	*buf++ = *type++;
-	*buf++ = *type++;
-	*buf++ = *type;
-
-	while (--data_len) {
-		*buf++ = *data++;
-	}
-	*buf++ = *data;
-
-	*buf++ = temp & 0xFF;
-	*buf++ = (temp >> 8) & 0xFF;
-	*buf++ = (temp >> 16) & 0xFF;
-	*buf++ = (temp >> 24) & 0xFF;
 }
