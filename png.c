@@ -1,68 +1,13 @@
 #include "png.h"
+#include "screen.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-void error(const char *msg) {
-	fprintf(stderr, "%s\n", msg);
-	exit(EXIT_FAILURE);
-}
-
-/* ========================================================================== */
-
-uint8_t *write_be_be(uint32_t value, uint8_t *buf) {
-	*buf++ = (value >> 0)  & 0xFF;
-	*buf++ = (value >> 8)  & 0xFF;
-	*buf++ = (value >> 16) & 0xFF;
-	*buf++ = (value >> 24) & 0xFF;
-	return buf;
-}
-
-uint8_t *write_be_le(uint32_t value, uint8_t *buf) {
-	*buf++ = (value >> 24) & 0xFF;
-	*buf++ = (value >> 16) & 0xFF;
-	*buf++ = (value >> 8)  & 0xFF;
-	*buf++ = (value >> 0)  & 0xFF;
-	return buf;
-}
-
-uint8_t *write_be_me1(uint32_t value, uint8_t *buf) {
-	*buf++ = (value >> 8)  & 0xFF;
-	*buf++ = (value >> 0)  & 0xFF;
-	*buf++ = (value >> 16) & 0xFF;
-	*buf++ = (value >> 24) & 0xFF;
-	return buf;
-}
-
-uint8_t *write_be_me2(uint32_t value, uint8_t *buf) {
-	*buf++ = (value >> 16) & 0xFF;
-	*buf++ = (value >> 24) & 0xFF;
-	*buf++ = (value >> 0)  & 0xFF;
-	*buf++ = (value >> 8)  & 0xFF;
-	return buf;
-}
-
-write_be_function get_write_be_function() {
-	uint8_t buf[] = {0x00, 0x01, 0x02, 0x03};
-
-	switch (*((uint32_t *)buf)) {
-		case 0x00010203: // big-endian
-			return write_be_be;
-		case 0x03020100: // little-endian
-			return write_be_le;
-		case 0x01000302: // middle-endian, PDP-11 style
-			return write_be_me1;
-		case 0x02030001: // middle-endian, Honeywell 316 style
-			return write_be_me2;
-		default:         // unknown endianness
-			error("error: endianness of processor could not be determined");
-	}
-}
-
-write_be_function write_be = NULL;
-
-/* ========================================================================== */
-
+// A precomputed 32-bit CRC (Cyclic Redundancy Code) lookup table, used to speed
+// up the creation of a CRC checksum for each chunk in a PNG file. More
+// information about how to get the standard 32-bit CRC values may be found at
+// http://www.barrgroup.com/Embedded-Systems/How-To/CRC-Calculation-C-Code.
 const uint32_t crc32_lookup_table[] = {
 	0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA, 0x076DC419, 0x706AF48F,
 	0xE963A535, 0x9E6495A3, 0x0EDB8832, 0x79DCB8A4, 0xE0D5E91E, 0x97D2D988,
@@ -109,12 +54,339 @@ const uint32_t crc32_lookup_table[] = {
 	0xB40BBE37, 0xC30C8EA1, 0x5A05DF1B, 0x2D02EF8D
 };
 
-uint32_t crc32(const uint8_t *buf, size_t buf_len) {
-	uint32_t crc = 0xFFFFFFFF;
+// The idea of optimizing the Adler-32 checksum by delaying the modulo
+// operation for MAX_ADDITIONS is accredited to Mark Adler. His Adler-32 code
+// may be found at https://github.com/madler/zlib/blob/master/adler32.c.
 
-	while (buf_len--) {
-		crc = crc32_lookup_table[(crc ^ *buf++) & 0xFF] ^ (crc >> 8);
+#define BASE 65521 // largest prime smaller than 65536
+
+// largest x such that 255(x+2)(x+3)/2 + (x+3)(BASE-1) <= 2^32-1
+#define MAX_ADDITIONS_RGB 5550
+
+// largest x such that 255(x+3)(x+4)/2 + (x+4)(BASE-1) <= 2^32-1
+#define MAX_ADDITIONS_RGBA 5549
+
+// updates the two parts of an Adler-32 checksum with the given character
+#define ADLER(character, sum1, sum2) {(sum1) += (character); (sum2) += (sum1);}
+
+// applies the modulo operation to the two parts of an Adler-32 checksum
+#define MOD_SUMS(sum1, sum2) {(sum1) %= BASE; (sum2) %= BASE;}
+
+/* ========================================================================== */
+
+#define PNG_RGB 2 // code used in PNG format to denote "truecolor"
+#define PNG_RGBA 6 // code used in PNG format to denote "truecolor with alpha"
+
+#define IHDR 0x49484452 // hex for "IHDR"
+#define IHDR_CRC 0x575E51F5 // CRC checksum of the string "IHDR"
+
+#define IDAT 0x49444154 // hex for "IDAT"
+#define IDAT_CRC 0xCA50F9E1 // CRC checksum of the string "IDAT"
+
+#define IEND 0x49454E44 // hex for "IEND"
+#define IEND_CRC_C 0xAE426082 // 1's complement of the CRC checksum of "IEND"
+
+// places an integer into a file stream in big-endian format
+#define PUTC_INT(integer, fp) {                                                \
+	putc((integer) >> 24 & 0xFF, fp);                                         \
+	putc((integer) >> 16 & 0xFF, fp);                                         \
+	putc((integer) >> 8 & 0xFF, fp);                                          \
+	putc((integer) & 0xFF, fp);                                               \
+}
+
+// places a character into a file stream and updates the CRC checksum of that
+// stream
+#define PUTC_AND_CRC(character, fp, crc) {                                     \
+	putc(character, fp);                                                      \
+	(crc) = crc32_lookup_table[((crc) ^ (character)) & 0xFF] ^ ((crc) >> 8);  \
+}
+
+// places an integer into a file stream in big-endian format and updates the CRC
+// checksum of that stream
+#define PUTC_AND_CRC_INT(integer, fp, crc) {                                   \
+	PUTC_AND_CRC((integer) >> 24 & 0xFF, fp, crc);                            \
+	PUTC_AND_CRC((integer) >> 16 & 0xFF, fp, crc);                            \
+	PUTC_AND_CRC((integer) >> 8 & 0xFF, fp, crc);                             \
+	PUTC_AND_CRC((integer) & 0xFF, fp, crc);                                  \
+}
+
+// A deflate block can hold at most 0xFFFF bytes, since its length is stored in
+// 2 bytes.
+#define MAX_BLOCK_LEN 0xFFFF
+
+// An PNG chunk can hold at most 0xFFFFFFFF bytes, since its length is stored in
+// 4 bytes.
+#define MAX_CHUNK_LEN 0xFFFFFFFF
+
+// largest x such that 6 + 5 * ceil(x / MAX_BLOCK_LEN) + x <= MAX_CHUNK_LEN
+// (A PNG chunk contains the 2-byte header "\x78\x01", followed by all its data
+// separated into deflate blocks, each of which has a 5-byte header, followed by
+// an Adler-32 checksum of its data.)
+#define MAX_DATA_LEN 0xFFFB0008
+
+#define MAX_NUM_BLOCKS 0xFFFD // ceil(MAX_DATA_LEN / MAX_BLOCK_LEN)
+
+// places the header for a full deflate block into a file stream and updates the
+// CRC checksum of that stream
+#define BLOCK_HEADER(fp, crc) {                                                \
+	PUTC_AND_CRC(0, fp, crc);                                                 \
+	PUTC_AND_CRC(0xFF, fp, crc);                                              \
+	PUTC_AND_CRC(0xFF, fp, crc);                                              \
+	PUTC_AND_CRC(0, fp, crc);                                                 \
+	PUTC_AND_CRC(0, fp, crc);                                                 \
+}
+
+// places the header for the last deflate block in a PNG data chunk into a file
+// stream and updates the CRC checksum of that stream
+#define LAST_BLOCK_HEADER(fp, crc, bytes_remaining) {                          \
+	PUTC_AND_CRC(1, fp, crc);                                                 \
+	PUTC_AND_CRC(bytes_remaining & 0xFF, fp, crc);                            \
+	PUTC_AND_CRC(bytes_remaining >> 8 & 0xFF, fp, crc);                       \
+	PUTC_AND_CRC((bytes_remaining ^ 0xFF) & 0xFF, fp, crc);                   \
+	PUTC_AND_CRC((bytes_remaining >> 8 ^ 0xFF) & 0xFF, fp, crc);              \
+}
+
+// places the first 8 bytes of a PNG file into a file stream
+#define PNG_SIG(fp) {                                                          \
+	putc(0x89, fp);                                                           \
+	putc('P' , fp);                                                           \
+	putc('N' , fp);                                                           \
+	putc('G' , fp);                                                           \
+	putc('\r', fp);                                                           \
+	putc('\n', fp);                                                           \
+	putc(0x1A, fp);                                                           \
+	putc('\n', fp);                                                           \
+}
+
+/* ========================================================================== */
+
+void header_chunk(
+	uint32_t width, uint32_t height, uint8_t color_type,
+	FILE *fp
+	) {
+	PUTC_INT(13, fp); // 2 ints and 5 chars take up 13 bytes
+	PUTC_INT(IHDR, fp);
+
+	uint32_t crc = IHDR_CRC;
+	PUTC_AND_CRC_INT(width, fp, crc);
+	PUTC_AND_CRC_INT(height, fp, crc);
+	PUTC_AND_CRC(8, fp, crc); // 8 = 8-bit color depth
+	PUTC_AND_CRC(color_type, fp, crc);
+	PUTC_AND_CRC(0, fp, crc); // 0 = deflate compression
+	PUTC_AND_CRC(0, fp, crc); // 0 = adaptive filtering
+	PUTC_AND_CRC(0, fp, crc); // 0 = no interlace
+
+	crc ^= 0xFFFFFFFF;
+	PUTC_INT(crc, fp);
+}
+
+const uint32_t *data_chunk_rgb(
+	uint32_t width, uint32_t num_blocks, uint32_t chunk_length,
+	const uint32_t *data, FILE *fp
+	) {
+	PUTC_INT(chunk_length, fp);
+	PUTC_INT(IDAT, fp);
+
+	uint32_t crc = IDAT_CRC;
+	PUTC_AND_CRC(0x78, fp, crc);
+	PUTC_AND_CRC(0x01, fp, crc);
+
+	uint32_t adler_sum1 = 1;
+	uint32_t adler_sum2 = 0;
+	uint32_t block_pos = 0;
+	uint32_t line_pos = 0;
+	uint32_t mod_delay = MAX_ADDITIONS_RGB;
+	uint32_t cur_value;
+
+	chunk_length -= 6;
+	while (chunk_length) {
+		if (block_pos-- == 0) {
+			chunk_length -= 5;
+			if (--num_blocks) {
+				BLOCK_HEADER(fp, crc);
+				block_pos = MAX_BLOCK_LEN;
+			}
+			else {
+				LAST_BLOCK_HEADER(fp, crc, chunk_length);
+			}
+		}
+		else {
+			if (line_pos-- == 0) {
+				chunk_length--;
+				mod_delay--;
+				PUTC_AND_CRC(0, fp, crc);
+				adler_sum2 += adler_sum1;
+				line_pos = width;
+			}
+			else {
+				chunk_length -= 3;
+				mod_delay -= 3;
+				cur_value = *data++;
+				PUTC_AND_CRC(cur_value >> 16 & 0xFF, fp, crc);
+				PUTC_AND_CRC(cur_value >> 8 & 0xFF, fp, crc);
+				PUTC_AND_CRC(cur_value & 0xFF, fp, crc);
+				ADLER(cur_value >> 16 & 0xFF, adler_sum1, adler_sum2);
+				ADLER(cur_value >> 8 & 0xFF, adler_sum1, adler_sum2);
+				ADLER(cur_value & 0xFF, adler_sum1, adler_sum2);
+			}
+			if (mod_delay <= 0) {
+				MOD_SUMS(adler_sum1, adler_sum2);
+				mod_delay = MAX_ADDITIONS_RGB;
+			}
+		}
 	}
 
-	return crc ^ 0xFFFFFFFF;
+	MOD_SUMS(adler_sum1, adler_sum2);
+
+	PUTC_AND_CRC(adler_sum1 >> 8 & 0xFF, fp, crc);
+	PUTC_AND_CRC(adler_sum1 & 0xFF, fp, crc);
+	PUTC_AND_CRC(adler_sum2 >> 8 & 0xFF, fp, crc);
+	PUTC_AND_CRC(adler_sum2 & 0xFF, fp, crc);
+
+	crc ^= 0xFFFFFFFF;
+	PUTC_INT(crc, fp);
+
+	return data;
+}
+
+const uint32_t *data_chunk_rgba(
+	uint32_t width, uint32_t num_blocks, uint32_t chunk_length,
+	const uint32_t *data, FILE *fp
+	) {
+	PUTC_INT(chunk_length, fp);
+	PUTC_INT(IDAT, fp);
+
+	uint32_t crc = IDAT_CRC;
+	PUTC_AND_CRC(0x78, fp, crc);
+	PUTC_AND_CRC(0x01, fp, crc);
+
+	uint32_t adler_sum1 = 1;
+	uint32_t adler_sum2 = 0;
+	uint32_t block_pos = 0;
+	uint32_t line_pos = 0;
+	uint32_t mod_delay = MAX_ADDITIONS_RGBA;
+	uint32_t cur_value;
+
+	chunk_length -= 6;
+	while (chunk_length) {
+		if (block_pos-- == 0) {
+			chunk_length -= 5;
+			if (--num_blocks) {
+				BLOCK_HEADER(fp, crc);
+				block_pos = MAX_BLOCK_LEN;
+			}
+			else {
+				LAST_BLOCK_HEADER(fp, crc, chunk_length);
+			}
+		}
+		else {
+			if (line_pos-- == 0) {
+				chunk_length--;
+				mod_delay--;
+				PUTC_AND_CRC(0, fp, crc);
+				adler_sum2 += adler_sum1;
+				line_pos = width;
+			}
+			else {
+				chunk_length -= 4;
+				mod_delay -= 4;
+				cur_value = *data++;
+				PUTC_AND_CRC_INT(cur_value, fp, crc);
+				ADLER(cur_value >> 24 & 0xFF, adler_sum1, adler_sum2);
+				ADLER(cur_value >> 16 & 0xFF, adler_sum1, adler_sum2);
+				ADLER(cur_value >> 8 & 0xFF, adler_sum1, adler_sum2);
+				ADLER(cur_value & 0xFF, adler_sum1, adler_sum2);
+			}
+			if (mod_delay <= 0) {
+				MOD_SUMS(adler_sum1, adler_sum2);
+				mod_delay = MAX_ADDITIONS_RGBA;
+			}
+		}
+	}
+
+	MOD_SUMS(adler_sum1, adler_sum2);
+
+	PUTC_AND_CRC(adler_sum1 >> 8 & 0xFF, fp, crc);
+	PUTC_AND_CRC(adler_sum1 & 0xFF, fp, crc);
+	PUTC_AND_CRC(adler_sum2 >> 8 & 0xFF, fp, crc);
+	PUTC_AND_CRC(adler_sum2 & 0xFF, fp, crc);
+
+	crc ^= 0xFFFFFFFF;
+	PUTC_INT(crc, fp);
+
+	return data;
+}
+
+void data_chunks(
+	uint32_t width, uint32_t height, uint8_t color_type,
+	const uint32_t *data, FILE *fp
+	) {
+	uint64_t data_length;
+	const uint32_t *(* data_chunk_fun)(
+		uint32_t, uint32_t, uint32_t, const uint32_t *, FILE *
+		);
+
+	if (color_type == PNG_RGB) {
+		data_length = (uint64_t)height * (3 * width + 1);
+		// 3 bytes per pixel, plus a zero byte at the start of each scanline
+		data_chunk_fun = data_chunk_rgb;
+	}
+	else if (color_type == PNG_RGBA) {
+		data_length = (uint64_t)height * (4 * width + 1);
+		// 4 bytes per pixel, plus a zero byte at the start of each scanline
+		data_chunk_fun = data_chunk_rgba;
+	}
+	else {
+		fprintf(stderr, "Error: unknown color type\n");
+		exit(EXIT_FAILURE);
+	}
+
+	while (data_length >= MAX_DATA_LEN) {
+		data_length -= MAX_DATA_LEN;
+		data = data_chunk_fun(width, MAX_NUM_BLOCKS, MAX_CHUNK_LEN, data, fp);
+	}
+
+	if (data_length) {
+		uint32_t num_blocks = 1 + (data_length - 1) / MAX_BLOCK_LEN;
+		// ceil(data_length / MAX_BLOCK_LEN)
+
+		data_chunk_fun(
+			width, num_blocks,
+			6 + 5 * num_blocks + (uint32_t)data_length,
+			// 2-byte header "\x78\x01", plus a 5-byte header per deflate
+			// block, plus the remaining data, plus a 4-byte Adler-32
+			// checksum of the remaining data
+			data, fp
+			);
+	}
+}
+
+void end_chunk(FILE *fp) {
+	PUTC_INT(0, fp);
+	PUTC_INT(IEND, fp);
+	PUTC_INT(IEND_CRC_C, fp);
+}
+
+/* ========================================================================== */
+
+void make_png(
+	const char *name, const screen s, char color_type
+	) {
+	FILE *fp = fopen(name, "wb");
+	PNG_SIG(fp);
+	header_chunk(s->width, s->height, color_type, fp);
+	data_chunks(s->width, s->height, color_type, s->data, fp);
+	end_chunk(fp);
+	fclose(fp);
+}
+
+int main() {
+	screen s = make_screen(200, 200);
+	plot(s, 0, 0, rgb(0, 255, 0));
+	plot(s, 0, 1, rgb(255, 255, 255));
+	plot(s, 1, 0, rgb(255, 255, 255));
+	plot(s, 1, 1, rgb(255, 255, 255));
+	plot(s, 100, 100, rgb(255, 255, 255));
+	plot(s, 150, 150, rgb(255, 255, 255));
+	make_png("test.png", s, PNG_RGB);
 }
