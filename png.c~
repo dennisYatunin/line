@@ -198,7 +198,7 @@ const uint32_t *data_chunk_rgb(
 	chunk_length -= 6;
 	while (chunk_length) {
 		if (block_pos-- == 0) {
-printf("NUM BLOCKS = %d\n", num_blocks);
+printf("BLOCK POS = %d\n", block_pos);
 			chunk_length -= 5;
 			if (--num_blocks) {
 				BLOCK_HEADER(fp, crc);
