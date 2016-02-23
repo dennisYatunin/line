@@ -58,13 +58,10 @@ const uint32_t crc32_lookup_table[] = {
 // operation for MAX_ADDITIONS is accredited to Mark Adler. His Adler-32 code
 // may be found at https://github.com/madler/zlib/blob/master/adler32.c.
 
-#define BASE 65521 // largest prime smaller than 65536
+#define BASE 65521 // largest prime number smaller than 2^16
 
-// largest x such that 255(x+2)(x+3)/2 + (x+3)(BASE-1) <= 2^32-1
-#define MAX_ADDITIONS_RGB 5550
-
-// largest x such that 255(x+3)(x+4)/2 + (x+4)(BASE-1) <= 2^32-1
-#define MAX_ADDITIONS_RGBA 5549
+// largest x such that 255x(x+1)/2 + (x+1)(BASE-1) <= 2^32-1
+#define MAX_ADDITIONS 5552
 
 // updates the two parts of an Adler-32 checksum with the given character
 #define ADLER(character, sum1, sum2) {(sum1) += (character); (sum2) += (sum1);}
@@ -143,6 +140,28 @@ const uint32_t crc32_lookup_table[] = {
 	PUTC_AND_CRC((bytes_remaining >> 8 ^ 0xFF) & 0xFF, fp, crc);              \
 }
 
+// places the next byte of a deflate block into a file stream and updates the
+// CRC checksum of that stream, as well as the Adler-32 checksum of the block
+#define ADD_NEXT_BYTE() {                                                      \
+	if (line_pos == max_line_pos) {                                           \
+		printf("STARTING NEW LINE %d; BLOCK POS = %u\n", i, block_pos); i++; \
+		PUTC_AND_CRC(0, fp, crc);                                            \
+		adler_sum2 += adler_sum1;                                            \
+		line_pos = 0;                                                        \
+	}                                                                         \
+	else {                                                                    \
+		cur_byte = *data++;                                                  \
+		printf("CUR BYTE = %u\n", cur_byte);                                 \
+		PUTC_AND_CRC(cur_byte, fp, crc);                                     \
+		ADLER(cur_byte, adler_sum1, adler_sum2);                             \
+		line_pos++;                                                          \
+	}                                                                         \
+	if (++mod_delay == MAX_ADDITIONS) {                                       \
+		MOD_SUMS(adler_sum1, adler_sum2);                                    \
+		mod_delay = 0;                                                       \
+	}                                                                         \
+}
+
 // places the first 8 bytes of a PNG file into a file stream
 #define PNG_SIG(fp) {                                                          \
 	putc(0x89, fp);                                                           \
@@ -177,9 +196,10 @@ void header_chunk(
 	PUTC_INT(crc, fp);
 }
 
-const uint32_t *data_chunk_rgb(
-	uint32_t width, uint32_t num_blocks, uint32_t chunk_length,
-	const uint32_t *data, FILE *fp
+uint32_t data_chunk(
+	uint32_t num_blocks, uint32_t chunk_length,
+	uint32_t line_pos, uint32_t max_line_pos,
+	uint8_t const **datap, FILE *fp
 	) {
 	PUTC_INT(chunk_length, fp);
 	PUTC_INT(IDAT, fp);
@@ -187,51 +207,30 @@ const uint32_t *data_chunk_rgb(
 	uint32_t crc = IDAT_CRC;
 	PUTC_AND_CRC(0x78, fp, crc);
 	PUTC_AND_CRC(0x01, fp, crc);
-
 	uint32_t adler_sum1 = 1;
 	uint32_t adler_sum2 = 0;
-	uint32_t block_pos = 0;
-	uint32_t line_pos = 0;
-	uint32_t mod_delay = MAX_ADDITIONS_RGB;
-	uint32_t cur_value;
+	uint32_t mod_delay = 0;
+	const uint8_t *data = *datap;
+
+	uint32_t block_pos;
+	uint8_t cur_byte;
 
 	chunk_length -= 6;
-	while (chunk_length) {
-		if (block_pos-- == 0) {
-printf("NUM BLOCKS = %d\n", num_blocks);
-			chunk_length -= 5;
-			if (--num_blocks) {
-				BLOCK_HEADER(fp, crc);
-				block_pos = MAX_BLOCK_LEN;
-			}
-			else {
-				LAST_BLOCK_HEADER(fp, crc, chunk_length);
-			}
+	int i = 0;
+
+	while (--num_blocks) {
+		BLOCK_HEADER(fp, crc);
+		chunk_length -= 5 + MAX_BLOCK_LEN;
+		block_pos = MAX_BLOCK_LEN;
+		while (block_pos--) {
+			ADD_NEXT_BYTE();
 		}
-		else {
-			if (line_pos-- == 0) {
-				chunk_length--;
-				mod_delay--;
-				PUTC_AND_CRC(0, fp, crc);
-				adler_sum2 += adler_sum1;
-				line_pos = width;
-			}
-			else {
-				chunk_length -= 3;
-				mod_delay -= 3;
-				cur_value = *data++;
-				PUTC_AND_CRC(cur_value >> 16 & 0xFF, fp, crc);
-				PUTC_AND_CRC(cur_value >> 8 & 0xFF, fp, crc);
-				PUTC_AND_CRC(cur_value & 0xFF, fp, crc);
-				ADLER(cur_value >> 16 & 0xFF, adler_sum1, adler_sum2);
-				ADLER(cur_value >> 8 & 0xFF, adler_sum1, adler_sum2);
-				ADLER(cur_value & 0xFF, adler_sum1, adler_sum2);
-			}
-			if (mod_delay <= 0) {
-				MOD_SUMS(adler_sum1, adler_sum2);
-				mod_delay = MAX_ADDITIONS_RGB;
-			}
-		}
+	}
+
+	chunk_length -= 5;
+	LAST_BLOCK_HEADER(fp, crc, chunk_length);
+	while (chunk_length--) {
+		ADD_NEXT_BYTE();
 	}
 
 	MOD_SUMS(adler_sum1, adler_sum2);
@@ -244,117 +243,51 @@ printf("NUM BLOCKS = %d\n", num_blocks);
 	crc ^= 0xFFFFFFFF;
 	PUTC_INT(crc, fp);
 
-	return data;
-}
-
-const uint32_t *data_chunk_rgba(
-	uint32_t width, uint32_t num_blocks, uint32_t chunk_length,
-	const uint32_t *data, FILE *fp
-	) {
-	PUTC_INT(chunk_length, fp);
-	PUTC_INT(IDAT, fp);
-
-	uint32_t crc = IDAT_CRC;
-	PUTC_AND_CRC(0x78, fp, crc);
-	PUTC_AND_CRC(0x01, fp, crc);
-
-	uint32_t adler_sum1 = 1;
-	uint32_t adler_sum2 = 0;
-	uint32_t block_pos = 0;
-	uint32_t line_pos = 0;
-	uint32_t mod_delay = MAX_ADDITIONS_RGBA;
-	uint32_t cur_value;
-
-	chunk_length -= 6;
-	while (chunk_length) {
-		if (block_pos-- == 0) {
-			chunk_length -= 5;
-			if (--num_blocks) {
-				BLOCK_HEADER(fp, crc);
-				block_pos = MAX_BLOCK_LEN;
-			}
-			else {
-				LAST_BLOCK_HEADER(fp, crc, chunk_length);
-			}
-		}
-		else {
-			if (line_pos-- == 0) {
-				chunk_length--;
-				mod_delay--;
-				PUTC_AND_CRC(0, fp, crc);
-				adler_sum2 += adler_sum1;
-				line_pos = width;
-			}
-			else {
-				chunk_length -= 4;
-				mod_delay -= 4;
-				cur_value = *data++;
-				PUTC_AND_CRC_INT(cur_value, fp, crc);
-				ADLER(cur_value >> 24 & 0xFF, adler_sum1, adler_sum2);
-				ADLER(cur_value >> 16 & 0xFF, adler_sum1, adler_sum2);
-				ADLER(cur_value >> 8 & 0xFF, adler_sum1, adler_sum2);
-				ADLER(cur_value & 0xFF, adler_sum1, adler_sum2);
-			}
-			if (mod_delay <= 0) {
-				MOD_SUMS(adler_sum1, adler_sum2);
-				mod_delay = MAX_ADDITIONS_RGBA;
-			}
-		}
-	}
-
-	MOD_SUMS(adler_sum1, adler_sum2);
-
-	PUTC_AND_CRC(adler_sum2 >> 8 & 0xFF, fp, crc);
-	PUTC_AND_CRC(adler_sum2 & 0xFF, fp, crc);
-	PUTC_AND_CRC(adler_sum1 >> 8 & 0xFF, fp, crc);
-	PUTC_AND_CRC(adler_sum1 & 0xFF, fp, crc);
-
-	crc ^= 0xFFFFFFFF;
-	PUTC_INT(crc, fp);
-
-	return data;
+	*datap = data;
+	return line_pos;
 }
 
 void data_chunks(
 	uint32_t width, uint32_t height, uint8_t color_type,
-	const uint32_t *data, FILE *fp
+	const uint32_t *data_stream, FILE *fp
 	) {
-	uint64_t data_length;
-	const uint32_t *(* data_chunk_fun)(
-		uint32_t, uint32_t, uint32_t, const uint32_t *, FILE *
-		);
+	uint32_t line_pos, max_line_pos;
 
 	if (color_type == PNG_RGB) {
-		data_length = (uint64_t)height * (3 * width + 1);
-		// 3 bytes per pixel, plus a zero byte at the start of each scanline
-		data_chunk_fun = data_chunk_rgb;
+		line_pos = max_line_pos = 3 * width;
+		// 3 bytes per pixel, plus a zero byte at the start of each line
 	}
 	else if (color_type == PNG_RGBA) {
-		data_length = (uint64_t)height * (4 * width + 1);
-		// 4 bytes per pixel, plus a zero byte at the start of each scanline
-		data_chunk_fun = data_chunk_rgba;
+		line_pos = max_line_pos = 4 * width;
+		// 4 bytes per pixel, plus a zero byte at the start of each line
 	}
 	else {
 		fprintf(stderr, "Error: unknown color type\n");
 		exit(EXIT_FAILURE);
 	}
 
+	const uint8_t *data = (const uint8_t *)data_stream;
+	uint64_t data_length = (uint64_t)height * (line_pos + 1);
+
 	while (data_length >= MAX_DATA_LEN) {
 		data_length -= MAX_DATA_LEN;
-		data = data_chunk_fun(width, MAX_NUM_BLOCKS, MAX_CHUNK_LEN, data, fp);
+		line_pos = data_chunk(
+			MAX_NUM_BLOCKS, MAX_CHUNK_LEN,
+			line_pos, max_line_pos, &data, fp
+			);
 	}
 
 	if (data_length) {
-		uint32_t num_blocks = 1 + (data_length - 1) / MAX_BLOCK_LEN;
+		uint32_t num_blocks = 1 + ((uint32_t)data_length - 1) / MAX_BLOCK_LEN;
 		// ceil(data_length / MAX_BLOCK_LEN)
 
-		data_chunk_fun(
-			width, num_blocks,
+		data_chunk(
+			num_blocks,
 			6 + 5 * num_blocks + (uint32_t)data_length,
 			// 2-byte header "\x78\x01", plus a 5-byte header per deflate
 			// block, plus the remaining data, plus a 4-byte Adler-32
 			// checksum of the remaining data
-			data, fp
+			line_pos, max_line_pos, &data, fp
 			);
 	}
 }
