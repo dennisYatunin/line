@@ -140,16 +140,6 @@ const uint32_t crc32_lookup_table[] = {
 	PUTC_AND_CRC((bytes_remaining >> 8 ^ 0xFF) & 0xFF, fp, crc);              \
 }
 
-// places the header for a full last deflate block in a PNG data chunk into a
-// file stream and updates the CRC checksum of that stream
-#define FULL_LAST_BLOCK_HEADER(fp, crc) {                                      \
-	PUTC_AND_CRC(1, fp, crc);                                                 \
-	PUTC_AND_CRC(0xFF, fp, crc);                                              \
-	PUTC_AND_CRC(0xFF, fp, crc);                                              \
-	PUTC_AND_CRC(0, fp, crc);                                                 \
-	PUTC_AND_CRC(0, fp, crc);                                                 \
-}
-
 // places the next byte of a deflate block into a file stream and updates the
 // CRC checksum of that stream, as well as the Adler-32 checksum of the block
 #define ADD_NEXT_BYTE() {                                                      \
@@ -281,6 +271,10 @@ void data_chunks(
 
 	while (data_length >= MAX_DATA_LEN) {
 		data_length -= MAX_DATA_LEN;
+		line_pos = data_chunk(
+			MAX_NUM_BLOCKS, MAX_CHUNK_LEN,
+			line_pos, max_line_pos, &data, fp
+			);
 	}
 
 	if (data_length) {
@@ -298,113 +292,6 @@ void data_chunks(
 	}
 }
 
-void data_chunks_rgb(
-	uint32_t width, uint32_t height, const uint32_t *data_stream, FILE *fp
-	) {
-	const uint8_t *data = (const uint8_t *)data_stream;
-
-	uint32_t max_line_pos = 3 * width;
-	// each pixel consists of 3 bytes
-
-	uint64_t data_len = (uint64_t)height * (max_line_pos + 1);
-	// the data transfered to the file will contain an additional 0 byte at
-	// the start of each line
-
-	uint32_t line_pos = max_line_pos;
-	uint32_t pixel_pos = 3;
-
-	uint32_t crc, adler_sum1, adler_sum2, mod_delay,
-	num_blocks, block_pos, cur_byte;
-
-	while (data_len >= MAX_DATA_LEN) {
-		PUTC_INT(MAX_CHUNK_LEN, fp);
-		PUTC_INT(IDAT, fp);
-
-		crc = IDAT_CRC;
-		PUTC_AND_CRC(0x78, fp, crc);
-		PUTC_AND_CRC(0x01, fp, crc);
-		adler_sum1 = 1;
-		adler_sum2 = 0;
-		mod_delay = 0;
-
-		num_blocks = MAX_NUM_BLOCKS;
-
-		while (--num_blocks) {
-			BLOCK_HEADER(fp, crc);
-			block_pos = MAX_BLOCK_LEN;
-			while (block_pos--) {
-				if (line_pos == max_line_pos) {
-					PUTC_AND_CRC(0, fp, crc);
-					adler_sum2 += adler_sum1;
-					line_pos = 0;
-				}
-				else {
-					if (pixel_pos == 3) {
-						data++;
-					}
-					cur_byte = *data++;
-					PUTC_AND_CRC(cur_byte, fp, crc);
-					ADLER(cur_byte, adler_sum1, adler_sum2);
-					line_pos++;
-					pixel_pos++;
-				}
-				if (++mod_delay == MAX_ADDITIONS) {
-					MOD_SUMS(adler_sum1, adler_sum2);
-					mod_delay = 0;
-				}
-			}
-		}
-		
-		FULL_LAST_BLOCK_HEADER(fp, crc);
-		block_pos = MAX_BLOCK_LEN;
-		while (block_pos--) {
-			if (line_pos == max_line_pos) {
-				PUTC_AND_CRC(0, fp, crc);
-				adler_sum2 += adler_sum1;
-				line_pos = 0;
-			}
-			else {
-				if (pixel_pos == 3) {
-					data++;
-				}
-				cur_byte = *data++;
-				PUTC_AND_CRC(cur_byte, fp, crc);
-				ADLER(cur_byte, adler_sum1, adler_sum2);
-				line_pos++;
-				pixel_pos++;
-			}
-			if (++mod_delay == MAX_ADDITIONS) {
-				MOD_SUMS(adler_sum1, adler_sum2);
-				mod_delay = 0;
-			}
-		}
-		
-		data_len -= MAX_DATA_LEN;
-	}
-
-	if (data_len) {
-		PUTC_INT(MAX_CHUNK_LEN, fp);
-		PUTC_INT(IDAT, fp);
-
-		crc = IDAT_CRC;
-		PUTC_AND_CRC(0x78, fp, crc);
-		PUTC_AND_CRC(0x01, fp, crc);
-		adler_sum1 = 1;
-		adler_sum2 = 0;
-		mod_delay = 0;
-
-		num_blocks = 1 + ((uint32_t)data_len - 1) / MAX_BLOCK_LEN;
-		// ceil(data_len / MAX_BLOCK_LEN)
-
-		uint32_t chunk_len = 6 + 5 * num_blocks + (uint32_t)data_len;
-		// 2-byte header "\x78\x01", plus a 5-byte header per deflate
-		// block, plus the remaining data, plus a 4-byte Adler-32
-		// checksum of the remaining data
-
-		
-	}
-}
-
 void end_chunk(FILE *fp) {
 	PUTC_INT(0, fp);
 	PUTC_INT(IEND, fp);
@@ -419,16 +306,7 @@ void make_png(
 	FILE *fp = fopen(name, "wb");
 	PNG_SIG(fp);
 	header_chunk(s->width, s->height, color_type, fp);
-	if (color_type == PNG_RGB) {
-		data_chunks_rgb(s->width, s->height, s->data, fp);
-	}
-	else if (color_type == PNG_RGBA) {
-		data_chunks_rgb(s->width, s->height, s->data, fp);
-	}
-	else {
-		fprintf(stderr, "Error: unknown color type\n");
-		exit(EXIT_FAILURE);
-	}
+	data_chunks(s->width, s->height, color_type, s->data, fp);
 	end_chunk(fp);
 	fclose(fp);
 }
