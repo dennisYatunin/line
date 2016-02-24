@@ -1,6 +1,6 @@
 RESULT = main
-HEADERS = png.h screen.h
-OBJECTS = main.o png.o screen.o
+HEADERS = png.h screen.h draw.h
+OBJECTS = main.o png.o screen.o draw.o
 
 ifeq ($(OS), Windows_NT)
 	RESULT := $(RESULT).exe
